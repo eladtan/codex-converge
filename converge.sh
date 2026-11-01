@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# codex-converge - detached Claude <-> Codex convergence loop.
+# codex-converge - detached Claude <-> Codex <-> Gemini convergence loop.
 #
 # Safety model: EVERY agent runs strictly read-only.
 #   - claude is invoked with --allowed-tools "Read Glob Grep" (no Write, Edit or Bash) and
@@ -10,6 +10,15 @@
 #     ("reader") whose own tool list is Read, Glob, Grep - it cannot spawn further subagents.
 #   - codex  is invoked with -s read-only (resume: sandbox_mode="read-only" forced).
 #     With subagents: agents.max_threads / max_concurrent_threads_per_session = N, max_depth = 1.
+#   - agy (1.5.0; Gemini through the Antigravity CLI) has no usable sandbox where user namespaces
+#     are disabled, so it gets three independent layers: --mode plan, --settings forcing the
+#     request-review policy with deny rules (headless -p runs refuse anything not permitted), and
+#     a PreToolUse hook generated per run that denies every tool except read_file under the
+#     context and run dirs. The hook matters because global allow rules in
+#     ~/.gemini/config/config.json would otherwise still auto-approve the commands they name.
+#     agy runs with its cwd in an empty per-agent workspace inside the run directory. No agy
+#     subagents. Live-tested 2026-11-01 on agy 1.4.12: write_file, edit_file and run_command
+#     (ls, touch, a nested agy) were all refused and the context dir was left untouched.
 # No agent can modify the user's project. Every file written by this loop
 # is written by THIS SCRIPT, into the run directory under ~/.codex-converge.
 #
@@ -17,26 +26,40 @@
 # conversation for the whole run. Claude: --session-id on its first call, --resume after.
 # Codex: first call with --json to capture the thread id, then `codex exec resume` with
 # sandbox_mode="read-only" forced on every resumed call (resume has no -s flag).
-# 1.4.0: session files are per agent id (.claude_session.A, .codex_session.R2, ...).
+# agy: first call prints --output-format json, whose conversation_id is resumed with --conversation.
+# 1.4.0: session files are per agent id (.claude_session.A, .codex_session.R2, .agy_session.R3, ...).
 #
 # Reviewer panel (1.4.0): one author (id A) and 1..6 reviewers (R1..RK) that review in
 # parallel. Converged = every reviewer returned a review this round AND every one approved.
+# 1.5.0: --trio makes the two CLIs other than the author the panel; --crosstalk shows each
+# reviewer the other reviewers' previous-round reviews from round 2 on.
 #
 # The worker runs in its own session with stdio redirected to files, so it
 # never needs a controlling terminal and survives SSH disconnect / logout.
 #
-#   converge.sh start --task "..." [--rounds N] [--dir DIR] [--author claude|codex] [--reviewer SPEC]...
+#   converge.sh start --task "..." [--rounds N] [--dir DIR] [--author claude|codex|agy] [--reviewer SPEC]... [--trio] [--crosstalk]
 #   converge.sh status [RUN] | watch [RUN] | show [RUN] | list | stop [RUN]
 
 set -uo pipefail
 
-VERSION="1.4.0"
+VERSION="1.5.0"
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 STATE_ROOT="${CODEX_CONVERGE_HOME:-$HOME/.codex-converge}"
 RUNS_DIR="$STATE_ROOT/runs"
 DEFAULT_ROUNDS=4
 MAX_REVIEWERS=6
 CALL_TIMEOUT="${CODEX_CONVERGE_CALL_TIMEOUT:-1800}"
+CLIS="claude codex agy"
+DEFAULT_AGY_MODEL="${CODEX_CONVERGE_AGY_MODEL:-gemini-4-argon}"
+
+# The only agy tool the PreToolUse guard lets through, and only for paths under the context dir or
+# the run dir. agy 1.4.12 headless has no list/search tool: read_file is its one reader.
+AGY_READ_TOOLS="read_file"
+# Per-call agy settings, never saved: the review policy (workspace reads auto-granted, anything else
+# needs an approval nobody can give headless) plus deny rules for commands, writes, MCP and network.
+# Not "strict": it refuses read_file too. A policy refusal ends a headless turn mid-reply, which is
+# why the guard refuses first, as a tool error the agent can read and continue past.
+AGY_SETTINGS='{"toolPermission":"request-review","permissions":{"deny":["command(*)","write_file(*)","write_file(/)","mcp(*)","read_url(*)","execute_url(*)"]}}'
 
 # Whether a live test showed codex subagents inherit the read-only sandbox. Empty = unverified,
 # and `start` warns whenever a codex agent gets subagents.
@@ -84,8 +107,8 @@ kill_tree() {
 }
 
 usage() {
-  cat <<'U'
-codex-converge - run a Claude <-> Codex review loop until they agree.
+  cat <<U
+codex-converge - run a Claude <-> Codex <-> Gemini (agy) review loop until they agree.
 
   converge.sh start --task "<task>" [options]
   converge.sh status [RUN]      state, round, per-reviewer verdicts, last activity
@@ -98,22 +121,29 @@ start options:
   --task "<text>"         the task (or --task-file FILE)
   --rounds N              max review rounds (default 4)
   --dir DIR               directory the agents READ for context (default: cwd)
-  --author claude|codex   who writes (default claude); without --reviewer the other CLI reviews
+  --author claude|codex|agy  who writes (default claude); without --reviewer or --trio one other
+                          CLI reviews: codex for a claude author, claude otherwise
   --reviewer SPEC         add a reviewer to the panel (repeatable, max 6). SPEC is comma-separated
-                          key=value: cli=claude|codex (required), model=, effort=, tier= (codex),
-                          subagents=N, focus=<text> (focus must be LAST; it takes the rest).
+                          key=value: cli=claude|codex|agy (required), model=, effort=, tier= (codex),
+                          subagents=N (not agy), focus=<text> (focus must be LAST; it takes the rest).
                           Omitted fields fall back to the side-wide flags below.
+  --trio                  the panel is the two CLIs other than the author (e.g. claude writes,
+                          codex and agy review); cannot be combined with --reviewer
+  --crosstalk             from round 2, each reviewer also reads the other reviewers' reviews
+                          from the previous round and may endorse or dispute their points
+  --agy-model M           agy (Gemini) model (default: $DEFAULT_AGY_MODEL)
+  --agy-effort E          agy effort, e.g. low|medium|high for argon (default: the model's default)
   --codex-model M         codex model slug (default: ~/.codex/config.toml)
   --codex-effort E        codex reasoning effort: low|medium|high|xhigh|max
   --codex-tier T          codex service tier, e.g. fast|flex|default (default: ~/.codex/config.toml)
   --claude-model M        claude model for the claude side (default: CLI default)
   --claude-effort E       claude effort: low|medium|high|xhigh|max (default: the calling agent's
-                          effort, from $CLAUDE_EFFORT when started inside Claude Code)
+                          effort, from \$CLAUDE_EFFORT when started inside Claude Code)
   --claude-subagents N    let each claude agent use up to N parallel read-only subagents
                           (prompt-enforced cap; 0 = none, same as unset)
   --codex-subagents N     cap each codex agent at N parallel subagents (hard cap via config);
                           0 = disable codex multi_agent; unset = leave ~/.codex/config.toml alone
-  --subagents N           shorthand for both (per-side flags win)
+  --subagents N           shorthand for both (per-side flags win); agy agents never get subagents
   --foreground            run inline instead of detaching (debugging)
   --fresh-context         start every agent call with a new context (pre-1.2.0 behaviour)
 
@@ -168,8 +198,9 @@ agent_label() {  # agent_label ID  -> "R1 codex/gpt-6-astra/high [focus: numeric
 
 cmd_start() {
   local task="" task_file="" rounds="$DEFAULT_ROUNDS" workdir="$PWD"
-  local author="claude" foreground=0
+  local author="claude" foreground=0 trio=0 crosstalk=0
   local codex_model="" codex_effort="" codex_tier="" claude_model="" claude_effort="${CLAUDE_EFFORT:-}" persist=1
+  local agy_model="$DEFAULT_AGY_MODEL" agy_effort=""
   local claude_subs="" codex_subs="" both_subs=""
   local -a reviewer_specs=()
 
@@ -181,6 +212,10 @@ cmd_start() {
       --dir)        workdir="${2:-}"; shift 2 ;;
       --author)     author="${2:-}"; shift 2 ;;
       --reviewer)   reviewer_specs+=("${2:-}"); shift 2 ;;
+      --trio)       trio=1; shift ;;
+      --crosstalk)  crosstalk=1; shift ;;
+      --agy-model)  agy_model="${2:-}"; shift 2 ;;
+      --agy-effort) agy_effort="${2:-}"; shift 2 ;;
       --codex-model)  codex_model="${2:-}"; shift 2 ;;
       --codex-effort) codex_effort="${2:-}"; shift 2 ;;
       --codex-tier)   codex_tier="${2:-}"; shift 2 ;;
@@ -196,6 +231,7 @@ cmd_start() {
     esac
   done
   case "$claude_effort" in ""|low|medium|high|xhigh|max) ;; *) die "bad --claude-effort / CLAUDE_EFFORT: $claude_effort" ;; esac
+  case "$agy_effort" in ""|low|medium|high|xhigh|max) ;; *) die "bad --agy-effort: $agy_effort" ;; esac
   [ -z "$claude_subs" ] && claude_subs="$both_subs"
   [ -z "$codex_subs" ] && codex_subs="$both_subs"
 
@@ -204,12 +240,17 @@ cmd_start() {
     task="$(cat "$task_file")"
   fi
   [ -n "$task" ] || die "--task or --task-file is required"
-  case "$author" in claude|codex) ;; *) die "--author must be claude or codex" ;; esac
+  case "$author" in claude|codex|agy) ;; *) die "--author must be claude, codex or agy" ;; esac
   case "$rounds" in ''|*[!0-9]*) die "--rounds must be a number" ;; esac
   [ -d "$workdir" ] || die "no such directory: $workdir"
   workdir="$(cd "$workdir" && pwd)"
 
-  # Default panel: one reviewer, the other CLI (the pre-1.4.0 loop).
+  local c
+  if [ "$trio" = 1 ]; then
+    [ "${#reviewer_specs[@]}" -eq 0 ] || die "--trio sets the panel itself; drop it or the --reviewer flags"
+    for c in $CLIS; do [ "$c" = "$author" ] || reviewer_specs+=("cli=$c"); done
+  fi
+  # Default panel: one reviewer, the other CLI (the pre-1.4.0 loop); claude reviews an agy author.
   if [ "${#reviewer_specs[@]}" -eq 0 ]; then
     if [ "$author" = claude ]; then reviewer_specs=("cli=codex"); else reviewer_specs=("cli=claude"); fi
   fi
@@ -220,11 +261,16 @@ cmd_start() {
   # Resolve every agent to concrete fields: ID_CLI ID_MODEL ID_EFFORT ID_TIER ID_SUBS ID_FOCUS.
   local -a agent_lines=()
   side_defaults() {  # side_defaults CLI -> sets d_model d_effort d_tier d_subs
-    if [ "$1" = claude ]; then d_model="$claude_model"; d_effort="$claude_effort"; d_tier=""; d_subs="$claude_subs"
-    else d_model="$codex_model"; d_effort="$codex_effort"; d_tier="$codex_tier"; d_subs="$codex_subs"; fi
+    case "$1" in
+      claude) d_model="$claude_model"; d_effort="$claude_effort"; d_tier=""; d_subs="$claude_subs" ;;
+      codex)  d_model="$codex_model"; d_effort="$codex_effort"; d_tier="$codex_tier"; d_subs="$codex_subs" ;;
+      agy)    d_model="$agy_model"; d_effort="$agy_effort"; d_tier=""; d_subs="" ;;
+    esac
   }
+  local used_clis=" "
   emit_agent() {  # emit_agent ID CLI MODEL EFFORT TIER SUBS FOCUS
     local f n=0
+    used_clis="$used_clis$2 "
     for f in CLI MODEL EFFORT TIER SUBS FOCUS; do
       n=$((n + 1))
       agent_lines+=("$(printf '%s_%s=%q' "$1" "$f" "${@:$((n + 1)):1}")")
@@ -257,24 +303,35 @@ cmd_start() {
         *)         die "--reviewer $k: unknown field '$key' (cli, model, effort, tier, subagents, focus)" ;;
       esac
     done
-    case "$cli" in claude|codex) ;; *) die "--reviewer $k: cli=claude or cli=codex is required" ;; esac
+    case "$cli" in claude|codex|agy) ;; *) die "--reviewer $k: cli=claude, cli=codex or cli=agy is required" ;; esac
     side_defaults "$cli"
     [ "$set_model" = 1 ]  || model="$d_model"
     [ "$set_effort" = 1 ] || effort="$d_effort"
     [ "$set_tier" = 1 ]   || tier="$d_tier"
     [ "$set_subs" = 1 ]   || subs="$d_subs"
-    if [ "$cli" = claude ]; then
-      case "$effort" in ""|low|medium|high|xhigh|max) ;; *) die "--reviewer $k: bad claude effort: $effort" ;; esac
+    if [ "$cli" != codex ]; then
+      case "$effort" in ""|low|medium|high|xhigh|max) ;; *) die "--reviewer $k: bad $cli effort: $effort" ;; esac
       [ -n "$tier" ] && die "--reviewer $k: tier= applies to codex only"
+    fi
+    if [ "$cli" = agy ] && [ -n "$subs" ] && [ "$subs" != 0 ]; then
+      die "--reviewer $k: agy agents run without subagents (their read-only guard is not verified for subagents)"
     fi
     emit_agent "R$k" "$cli" "$model" "$effort" "$tier" "$subs" "$focus"
   done
 
-  local claude_bin codex_bin
-  claude_bin="$(command -v claude || true)"
-  codex_bin="$(command -v codex || true)"
-  [ -n "$claude_bin" ] || die "claude CLI not found on PATH"
-  [ -n "$codex_bin" ] || die "codex CLI not found on PATH"
+  # Resolve only the CLIs this panel uses; agy also needs jq or python3 to read its JSON output.
+  local claude_bin="" codex_bin="" agy_bin="" json_tool=""
+  case "$used_clis" in *" claude "*) claude_bin="$(command -v claude || true)"; [ -n "$claude_bin" ] || die "claude CLI not found on PATH" ;; esac
+  case "$used_clis" in *" codex "*)  codex_bin="$(command -v codex || true)";   [ -n "$codex_bin" ]  || die "codex CLI not found on PATH" ;; esac
+  case "$used_clis" in *" agy "*)
+    agy_bin="$(command -v agy || true)"
+    [ -z "$agy_bin" ] && [ -x "$HOME/.gemini/bin/agy" ] && agy_bin="$HOME/.gemini/bin/agy"
+    [ -n "$agy_bin" ] || die "agy CLI not found on PATH or in ~/.gemini/bin"
+    if command -v jq >/dev/null 2>&1; then json_tool="$(command -v jq)"
+    elif command -v python3 >/dev/null 2>&1; then json_tool="$(command -v python3)"
+    else die "agy agents need jq or python3 to read agy's JSON output"; fi
+    ;;
+  esac
 
   local id run
   id="$(date +%Y%m%d-%H%M%S)-$$"
@@ -293,6 +350,11 @@ cmd_start() {
     echo "AUTHOR=$author"
     echo "CLAUDE_BIN=$claude_bin"
     echo "CODEX_BIN=$codex_bin"
+    echo "AGY_BIN=$agy_bin"
+    echo "JSON_TOOL=$json_tool"
+    echo "AGY_MODEL=$agy_model"
+    echo "AGY_EFFORT=$agy_effort"
+    echo "CROSSTALK=$crosstalk"
     echo "CODEX_MODEL=$codex_model"
     echo "CODEX_EFFORT=$codex_effort"
     echo "CODEX_TIER=$codex_tier"
@@ -318,6 +380,7 @@ cmd_start() {
     for i in $(seq 1 "$REVIEWERS"); do echo "  reviewer : $(agent_label "R$i")$(subs_desc "R$i")"; done
     echo "  rounds   : up to $ROUNDS"
     echo "  context  : $([ "$PERSIST" = 1 ] && echo 'persistent per agent (rounds 2+ resume the same session)' || echo 'fresh every call')"
+    [ "$REVIEWERS" -gt 1 ] && echo "  crosstalk: $([ "$CROSSTALK" = 1 ] && echo "on (from round 2 each reviewer reads the others' previous reviews)" || echo 'off (reviewers stay independent)')"
     echo "  parallel : author phase <= $(phase_width A)  review phase <= $(phase_width $(seq -f 'R%g' 1 "$REVIEWERS")) agent processes at once"
     warn=0
     for i in A $(seq -f 'R%g' 1 "$REVIEWERS"); do
@@ -328,6 +391,7 @@ cmd_start() {
     elif [ "$warn" = 1 ]; then
       echo "  sandbox  : codex subagent read-only inheritance verified ($CODEX_SUBAGENT_SANDBOX_VERIFIED)"
     fi
+    case "$used_clis" in *" agy "*) echo "  agy guard: --mode plan + request-review policy with deny rules + PreToolUse hook allowing only $AGY_READ_TOOLS under the context and run dirs" ;; esac
     echo "  reads    : $WORKDIR  (read-only, never modified)"
     echo "  artifacts: $run"
   ) | tee -a "$run/loop.log"
@@ -408,6 +472,104 @@ new_uuid() {
   printf '%s' "$u" | tr -d '\r\n' | tr 'A-Z' 'a-z'
 }
 
+shell_quote() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }  # STRING as one single-quoted shell word
+jesc() { printf '%s' "$1" | sed 's/[\\"]/\\&/g'; }                    # STRING escaped for a JSON string
+
+# agy_guard RUN WS - write the run's PreToolUse guard and the agent workspace's hooks.json.
+# The guard only ever denies: a tool it lets through still faces agy's own policy, so a payload
+# it cannot parse ends in a denial, never in a grant. Paths are compared lexically (realpath -s)
+# against the logical and physical forms of the context dir and the run dir.
+agy_guard() {
+  local run="$1" ws="$2" guard="$1/.agy-guard.sh" get_name get_path r pat=""
+  if [ ! -x "$guard" ]; then
+    case "$(basename "$JSON_TOOL")" in
+      jq) get_name="$(shell_quote "$JSON_TOOL") -r '.toolCall.name // empty'"
+          get_path="$(shell_quote "$JSON_TOOL") -r '.toolCall.args.Path // empty'" ;;
+      *)  get_name="$(shell_quote "$JSON_TOOL") -I -c 'import json,sys; print((json.load(sys.stdin).get(\"toolCall\") or {}).get(\"name\") or \"\")'"
+          get_path="$(shell_quote "$JSON_TOOL") -I -c 'import json,sys; print(((json.load(sys.stdin).get(\"toolCall\") or {}).get(\"args\") or {}).get(\"Path\") or \"\")'" ;;
+    esac
+    for r in "$WORKDIR" "$(cd "$WORKDIR" && pwd -P)" "$run" "$(cd "$run" && pwd -P)"; do
+      pat="$pat${pat:+|}$(shell_quote "$r")|$(shell_quote "$r")/*"
+    done
+    local deny_tool deny_path
+    deny_tool="{\"decision\":\"deny\",\"reason\":\"codex-converge: this agent is read-only and its only tool is read_file. No commands, edits, searches or subagents. Print your answer as your reply instead.\"}"
+    deny_path="{\"decision\":\"deny\",\"reason\":\"codex-converge: read_file is limited to absolute paths under $(jesc "$WORKDIR") and $(jesc "$run").\"}"
+    cat > "$guard.tmp" <<G
+#!/bin/sh
+# codex-converge PreToolUse guard for agy agents: refuse every tool except read_file under the
+# context dir or the run dir. It never grants: what it lets through still faces agy's own policy.
+payload="\$(cat)"
+name="\$(printf '%s' "\$payload" | $get_name 2>/dev/null)"
+case " $AGY_READ_TOOLS " in *" \$name "*) [ -n "\$name" ] ;; *) false ;; esac || { printf '%s\n' $(shell_quote "$deny_tool"); exit 0; }
+path="\$(printf '%s' "\$payload" | $get_path 2>/dev/null)"
+norm="\$(realpath -m -s -- "\$path" 2>/dev/null)"
+[ -n "\$norm" ] || norm="\$path"
+case "\$norm" in $pat) exit 0 ;; esac
+printf '%s\n' $(shell_quote "$deny_path")
+G
+    chmod +x "$guard.tmp" && mv "$guard.tmp" "$guard" || return 1
+  fi
+  mkdir -p "$ws/.agents" || return 1
+  local qguard; qguard="$(printf '%s' "$guard" | sed 's/[\\"]/\\&/g')"
+  printf '{"codex-converge-guard":{"PreToolUse":[{"matcher":"*","hooks":[{"type":"command","command":"%s","timeout":20}]}]}}\n' \
+    "$qguard" > "$ws/.agents/hooks.json"
+}
+
+# agy_index RUN - list the context dir's files into the run dir, once: agy agents cannot list
+# directories or search. Tracked files when the dir is in a git repo (git ls-files writes nothing),
+# else a shallow find; untracked files are left out, as a big run tree would swamp the list.
+agy_index() {
+  local f="$1/agy-files.txt"
+  [ -s "$f" ] && return 0
+  {
+    if git -C "$WORKDIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+      echo "# Files tracked by git under $WORKDIR, relative to it (untracked files are not listed)."
+      git -C "$WORKDIR" ls-files --recurse-submodules 2>/dev/null || git -C "$WORKDIR" ls-files 2>/dev/null
+    else
+      echo "# Files under $WORKDIR up to 4 levels deep, relative to it (hidden paths left out)."
+      (cd "$WORKDIR" && find . -maxdepth 4 -type f -not -path '*/.*' 2>/dev/null | sed 's|^\./||' | sort)
+    fi | head -n 20000
+  } > "$f.tmp" && mv "$f.tmp" "$f"
+}
+
+agy_note() {  # agy_note RUN - the tool limits an agy agent works under
+  cat <<N
+[Tools: your only tool is read_file, and only for absolute paths under $WORKDIR or $1.
+You cannot list directories, search, run commands or start subagents - those calls are refused.
+To find files, read $1/agy-files.txt (a file list for $WORKDIR); also follow the paths
+named in the task and the solution.]
+N
+}
+
+# agy_json FILE KEY - a top-level field of agy's --output-format json result (last JSON object in
+# FILE); arrays come back one element per line, objects as JSON, a missing key as nothing.
+agy_json() {
+  case "$(basename "$JSON_TOOL")" in
+    jq) "$JSON_TOOL" -rs --arg k "$2" 'last | .[$k] // empty
+          | if type == "array" then map(if type == "string" then . else tojson end) | join("\n")
+            elif type == "string" then . else tojson end' "$1" 2>/dev/null ;;
+    *)  "$JSON_TOOL" -I - "$1" "$2" 2>/dev/null <<'PY'
+import json, sys
+text = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+dec, i, last = json.JSONDecoder(), 0, None
+while True:
+    while i < len(text) and text[i].isspace():
+        i += 1
+    if i >= len(text):
+        break
+    last, i = dec.raw_decode(text, i)
+v = last.get(sys.argv[2]) if isinstance(last, dict) else None
+if isinstance(v, list):
+    print("\n".join(x if isinstance(x, str) else json.dumps(x) for x in v))
+elif isinstance(v, str):
+    print(v)
+elif v is not None:
+    print(json.dumps(v))
+PY
+    ;;
+  esac
+}
+
 # agent_call RUN ID PROMPT OUTFILE - one read-only agent call, run SYNCHRONOUSLY.
 # Callers always run it in the background and wait on it (see spawn_agent), so a TERM
 # arriving mid-call interrupts the wait at once, and reviewers can run in parallel.
@@ -454,6 +616,55 @@ agent_call() {
       < "$pfile" > "$out" 2>> "$run/loop.log"
     rc=$?
     [ "$rc" = 0 ] && [ -n "$new_sess" ] && printf '%s\n' "$new_sess" > "$sess_file"
+    return $rc
+  fi
+
+  if [ "$cli" = agy ]; then
+    # cwd is an empty per-agent workspace in the run dir: it carries the guard's hooks.json, and
+    # anything agy keeps per workspace lands there, never in $WORKDIR.
+    # No --disable-slash-commands: it switches --mode plan off. Prompts never start with "/".
+    local ws="$run/.agy-ws.$id" res="$run/.agy-result.$id.json" ptimeout=$((CALL_TIMEOUT - 60))
+    [ "$ptimeout" -lt 60 ] && ptimeout=60
+    agy_guard "$run" "$ws" || { log "$id agy: could not write the read-only guard; refusing to call agy"; return 1; }
+    agy_index "$run"
+    { agy_note "$run"; echo; cat "$pfile"; } > "$pfile.agy" && mv "$pfile.agy" "$pfile"
+    local -a g=(--mode plan --settings "$AGY_SETTINGS" --output-format json
+                --print-timeout "${ptimeout}s" --add-dir "$WORKDIR" --add-dir "$run")
+    [ -n "$model" ] && g+=(--model "$model")
+    [ -n "$effort" ] && g+=(--effort "$effort")
+    if [ "$resuming" = 1 ]; then
+      g+=(--conversation "$(cat "$sess_file")")
+      log "$id agy: resuming conversation $(cat "$sess_file")"
+    fi
+    # The prompt is one argv string, capped by the kernel at 128 KiB; a longer one is read from its file.
+    local ptext
+    if [ "$(wc -c < "$pfile")" -gt 100000 ]; then
+      ptext="Your complete instructions for this turn are in $pfile. Read that whole file now and follow it exactly."
+    else
+      ptext="$(cat "$pfile")"
+    fi
+    ( cd "$ws" && exec timeout "$CALL_TIMEOUT" "$AGY_BIN" "${g[@]}" -p="$ptext" ) \
+      < /dev/null > "$res" 2>> "$run/loop.log"
+    rc=$?
+    # A policy refusal (denied_actions) ends a headless turn mid-reply with status SUCCESS, so it
+    # counts as a failed call: a cut-off reply must never become the solution or a review.
+    local status reason denied
+    status="$(agy_json "$res" status)"
+    reason="$(agy_json "$res" finished_reason)"
+    denied="$(agy_json "$res" denied_actions)"
+    agy_json "$res" response > "$out"
+    if [ "$rc" = 0 ] && [ -n "$denied" ]; then
+      log "$id agy: agy's policy refused an action, which ended the turn early: $(printf '%s' "$denied" | tr '\n' ' ' | cut -c1-300)"
+      rc=1
+    elif [ "$rc" = 0 ] && { [ -n "$reason" ] || [ "$status" != SUCCESS ]; }; then
+      log "$id agy: turn did not complete (status=${status:-none} finished_reason=${reason:-none})"
+      rc=1
+    fi
+    if [ "$rc" = 0 ] && [ "${PERSIST:-0}" = 1 ] && [ ! -s "$sess_file" ]; then
+      local cid; cid="$(agy_json "$res" conversation_id)"
+      if [ -n "$cid" ]; then printf '%s\n' "$cid" > "$sess_file"; log "$id agy: conversation $cid"
+      else log "$id agy: no conversation_id in its JSON; later calls start fresh"; fi
+    fi
     return $rc
   fi
 
@@ -577,10 +788,17 @@ P
 
 build_review_prompt() {
   local sol="$1" changelog="$2" dissent="$3" r="$4" max="$5" task="$6" workdir="$7" id="$8" nrev="$9" focus="${10}"
-  local panel="" scope=""
+  local others="${11:-}"
+  local panel="" scope="" talk=""
   [ "$nrev" -gt 1 ] && panel="You are reviewer $id of a panel of $nrev reviewing in parallel; you will not see the
-others' reviews, so review independently. Changelog and dissent entries may be tagged with
-reviewer ids like [R2]."
+others' reviews of this round, so review independently. Changelog and dissent entries may be tagged
+with reviewer ids like [R2]."
+  [ -n "$others" ] && talk="CROSSTALK - the other reviewers' reviews from round $((r - 1)); read them too:
+$others
+Weigh their points against the CURRENT solution: some may already be fixed. Where you checked a
+point and agree, say so in one line tagged [AGREE Rk]. Where you think a point is wrong or
+overstated, say why, tagged [DISPUTE Rk] - the author reads both and has to weigh it. Raise an
+issue as your own only if you verified it yourself. Your verdict is yours alone."
   [ -n "$focus" ] && scope="YOUR FOCUS: $focus
 Review the solution for this aspect only; other reviewers cover the rest. Approve if it is
 sound on your aspect, even if you suspect issues elsewhere (mention those as [NIT] at most)."
@@ -598,6 +816,7 @@ Read these files now:
   $dissent    - points the author formally disagreed with
 
 Context directory (read-only): $workdir
+$talk
 
 Do NOT re-raise anything in $dissent unless you have new evidence - engage with
 the author's reasoning instead. Do not re-raise points already resolved per the
@@ -675,7 +894,7 @@ worker() {
   trap 'log "terminated by signal"; for p in $CHILD_PIDS; do kill_tree "$p"; done; set_state "$run" STATUS stopped; exit 143' TERM INT
 
   set_state "$run" STATUS running
-  log "run $RUN_ID on $HOST (v${VERSION:-?}) : author=$(agent_label A) reviewers=$nrev rounds=$ROUNDS"
+  log "run $RUN_ID on $HOST (v${VERSION:-?}) : author=$(agent_label A) reviewers=$nrev rounds=$ROUNDS crosstalk=${CROSSTALK:-0}"
   local k
   for k in $(seq 1 "$nrev"); do log "  R$k = $(agent_label "R$k")"; done
   log "context dir (read-only)=$WORKDIR"
@@ -694,7 +913,7 @@ worker() {
   split_author_output "$raw" "$sol" "$changelog" "$dissent" 0
   log "draft written ($(wc -l < "$sol") lines)"
 
-  local prev_sum="" cur_sum="" stalls=0 r=1
+  local prev_sum="" cur_sum="" stalls=0 r=1 prev_failed=""
   while [ "$r" -le "$ROUNDS" ]; do
     set_state "$run" ROUND "$r"
 
@@ -703,8 +922,18 @@ worker() {
     CHILD_PIDS=""
     for k in $(seq 1 "$nrev"); do
       set_state "$run" "R${k}_STATE" reviewing
+      # Crosstalk: the other reviewers' reviews from the previous round, minus calls that failed.
+      local others="" j prevf
+      if [ "${CROSSTALK:-0}" = 1 ] && [ "$r" -gt 1 ]; then
+        for j in $(seq 1 "$nrev"); do
+          prevf="$run/review-$((r - 1))-R$j.md"
+          [ "$j" = "$k" ] && continue
+          case "$prev_failed " in *" R$j "*) continue ;; esac
+          [ -s "$prevf" ] && others="$others  $prevf  - review by $(agent_label "R$j")"$'\n'
+        done
+      fi
       spawn_agent "$run" "R$k" \
-        "$(build_review_prompt "$sol" "$changelog" "$dissent" "$r" "$ROUNDS" "$task" "$WORKDIR" "R$k" "$nrev" "$(agent_field "R$k" FOCUS)")" \
+        "$(build_review_prompt "$sol" "$changelog" "$dissent" "$r" "$ROUNDS" "$task" "$WORKDIR" "R$k" "$nrev" "$(agent_field "R$k" FOCUS)" "$others")" \
         "$run/review-$r-R$k.md"
       pids[$k]="$SPAWNED_PID"
     done
@@ -733,6 +962,7 @@ worker() {
       fi
     done
     CHILD_PIDS=""
+    prev_failed="$failed_ids"
 
     if [ "$ok" = 0 ]; then
       log "every reviewer failed this round"
@@ -749,6 +979,7 @@ worker() {
 
     local note=""
     [ -n "$failed_ids" ] && note="(Reviewer(s)$failed_ids failed this round and have no review; they re-review next round.)"$'\n'
+    [ "${CROSSTALK:-0}" = 1 ] && [ "$r" -gt 1 ] && note="$note(Reviewers read each other's previous reviews: [AGREE Rk] endorses Rk's point, [DISPUTE Rk] argues against it. Weigh both; a disputed point still needs your own decision.)"$'\n'
 
     log "=== round $r/$ROUNDS : $(agent_label A) revising ==="
     prev_sum="$(cksum < "$sol")"

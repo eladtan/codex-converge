@@ -1,7 +1,7 @@
 ---
 name: codex-converge
-description: Run a detached Claude-vs-Codex convergence loop - a read-only author and a panel of one or more read-only reviewers (optionally with parallel subagents) draft, review and revise a written solution until every reviewer approves or they deadlock. Use when the user wants Claude and Codex to review each other, argue toward agreement, iterate until they agree, or run a long unattended review loop that must survive SSH disconnect.
-argument-hint: "<task to converge on> [rounds=N] [dir=PATH] [subagents=N] [reviewers=...]"
+description: Run a detached Claude / Codex / Gemini (agy) convergence loop - a read-only author and a panel of one or more read-only reviewers (optionally with parallel subagents, optionally reading each other's reviews) draft, review and revise a written solution until every reviewer approves or they deadlock. Use when the user wants Claude, Codex and/or Gemini to review each other, argue toward agreement, iterate until they agree, have three models work on one task together, or run a long unattended review loop that must survive SSH disconnect.
+argument-hint: "<task to converge on> [rounds=N] [dir=PATH] [trio] [crosstalk] [subagents=N] [reviewers=...]"
 allowed-tools: "Bash, Read, Glob, Grep"
 ---
 
@@ -9,7 +9,8 @@ allowed-tools: "Bash, Read, Glob, Grep"
 
 Drives a review loop: one agent writes a solution, a panel of one or more reviewers
 (default: one, the other CLI) critiques it in parallel, the author revises, repeat until
-every reviewer approves or the loop deadlocks. The
+every reviewer approves or the loop deadlocks. Three CLIs can take part: `claude`, `codex`
+and `agy` (Gemini through the Antigravity CLI, default model `gemini-4-argon`). The
 deliverable is a document, not a code change.
 
 The driver is `converge.sh`, in this skill's directory.
@@ -27,15 +28,37 @@ Every agent, and every subagent, runs **strictly read-only**:
 - `codex` is invoked with `-s read-only` (resume: `sandbox_mode="read-only"` forced). Codex
   subagents inherit that sandbox: live-tested 2026-09-24 on codex-cli 0.155.1, a sub-agent's
   patch was rejected by the read-only sandbox. `agents.max_depth=1` stops sub-sub-agents.
+- `agy` has no usable sandbox where user namespaces are disabled (this cluster), so it gets three
+  independent layers: `--mode plan`; `--settings` with `"toolPermission":"request-review"` and deny
+  rules for `command(*)`, `write_file(*)`, `mcp(*)`, `read_url(*)`, `execute_url(*)` (headless `-p`
+  runs refuse anything that needs an approval); and a `PreToolUse` hook, generated per run
+  (`.agy-guard.sh` + `.agy-ws.<id>/.agents/hooks.json`), that refuses every tool except
+  `read_file`, and `read_file` outside the context dir and the run dir. The hook only ever
+  refuses, so a payload it cannot parse ends in a refusal. It is the layer that beats global allow
+  rules in `~/.gemini/config/config.json` (here `command(/home/elads/.gemini/bin/agy)` would
+  otherwise let the agent start a nested agy with write permission). agy runs with its cwd in an
+  empty per-agent workspace inside the run directory and never gets subagents. Live-tested
+  2026-11-01 on agy 1.4.12: `write_file`, `edit_file`, `run_command` (`ls`, `touch`, nested agy)
+  all refused; context dir and its `.git` untouched.
+- Do not switch agy to `"toolPermission":"strict"`: it refuses `read_file` too. And keep the hook
+  refusing first: a refusal by agy's own policy ends a headless turn mid-reply (status still
+  SUCCESS, `denied_actions` set), so the loop treats any `denied_actions` as a failed call, while a
+  hook refusal comes back as a tool error the agent reads and continues past.
+- agy's headless toolset has no list, search or grep tool (`read_file` is its only reader), so
+  each run writes the context dir's git-tracked file list to `<run>/agy-files.txt` (non-git dirs:
+  `find -maxdepth 4`) and agy prompts point at it. Expect agy to be weaker than the others at
+  exploring a code base it is not pointed into; name the key files in the task.
 
-Neither can modify anything in the user's project. Every file the loop produces
+No agent can modify anything in the user's project. Every file the loop produces
 is written by `converge.sh` itself, into `~/.codex-converge/runs/<id>/`. This is
 what makes an unattended, disconnected loop safe to leave running: the worst
 case is a bad document in a scratch directory, never a mangled repo.
 
 Never add `--permission-mode acceptEdits`, `-s workspace-write`,
-`--dangerously-bypass-approvals-and-sandbox`, or similar to these invocations, and never give
-the `reader` subagent or the `--tools` list a write-capable tool. After a CLI upgrade, re-run
+`--dangerously-bypass-approvals-and-sandbox`, `--dangerously-skip-permissions`, `--mode accept-edits`,
+`--mode auto`, or similar to these invocations, never give the `reader` subagent or the `--tools`
+list a write-capable tool, never add a write, command or MCP tool to `AGY_READ_TOOLS`, and never
+pass agy `--disable-slash-commands` (it silently switches `--mode plan` off). After a CLI upgrade, re-run
 the subagent write test before trusting the sandbox notes above.
 If the user wants the agreed solution applied to their code, show them
 `solution.md` and let them apply it in a normal supervised session.
@@ -55,8 +78,12 @@ SKILL_DIR=~/.claude/skills/codex-converge
 | `--task "<text>"` | what to converge on (or `--task-file FILE`) | required |
 | `--dir DIR` | directory the agents read for context, never written | cwd |
 | `--rounds N` | max review rounds | 4 |
-| `--author claude\|codex` | who writes; without `--reviewer`, the other CLI reviews | claude |
+| `--author claude\|codex\|agy` | who writes; without `--reviewer`/`--trio`, one other CLI reviews (codex for claude, claude otherwise) | claude |
 | `--reviewer SPEC` | add a panel reviewer (repeatable, max 6, warns above 3); see below | one reviewer, the other CLI |
+| `--trio` | panel = the two CLIs other than the author (three models on one task); not with `--reviewer` | off |
+| `--crosstalk` | from round 2, each reviewer also reads the others' previous-round reviews | off |
+| `--agy-model M` | agy (Gemini) model | `gemini-4-argon` (env `CODEX_CONVERGE_AGY_MODEL`) |
+| `--agy-effort E` | agy effort; argon offers low\|medium\|high | the model's default |
 | `--codex-model M` | Codex model slug, e.g. `gpt-6-astra` | ~/.codex/config.toml |
 | `--codex-effort E` | Codex reasoning effort: low\|medium\|high\|xhigh\|max | config |
 | `--codex-tier T` | Codex service tier, e.g. `fast` (passed as `-c service_tier="T"`; 1.2.2) | config |
@@ -64,7 +91,7 @@ SKILL_DIR=~/.claude/skills/codex-converge
 | `--claude-effort E` | Claude effort (`--effort`): low\|medium\|high\|xhigh\|max; 1.2.3 | the calling agent's effort (`$CLAUDE_EFFORT`) |
 | `--claude-subagents N` | each Claude agent may use up to N parallel read-only subagents (**soft cap**: prompt-enforced; 0 = none) | unset = none |
 | `--codex-subagents N` | each Codex agent capped at N parallel subagents (**hard cap**: `agents.max_threads`, `max_concurrent_threads_per_session` = N, `max_depth` = 1); `0` = `--disable multi_agent` | unset = `~/.codex/config.toml` untouched |
-| `--subagents N` | shorthand for both; per-side flags win | unset |
+| `--subagents N` | shorthand for both; per-side flags win; agy never gets subagents | unset |
 | `--fresh-context` | new context every call instead of one session per agent | off |
 | `--foreground` | run inline, debugging only | off |
 
@@ -80,15 +107,23 @@ for reading they have not done yet - the persistent sessions carry the rest.
 
 Raise `--rounds` past 4 only if asked. Convergence, when it happens, almost
 always happens by round 3; past that the models mostly agree more politely.
-Each round is two full agent runs against both Anthropic and OpenAI quota.
+Each round is one author run plus one run per reviewer, against the quota of every CLI involved
+(a `--trio` round is three runs: Anthropic, OpenAI and Google).
+
+When the user asks for Claude, Codex and Gemini together, or "all three models", use `--trio`
+(author defaults to claude). Add `--crosstalk` when they want the models to talk to or argue with
+each other, not only with the author.
 
 ## Reviewer panel (1.4.0)
 
 `--reviewer "cli=codex,model=gpt-6-astra,effort=high,tier=fast,subagents=4,focus=numerical stability"`
+`--reviewer "cli=agy,effort=high,focus=physics and units"`
 
-- Comma-separated `key=value`; `cli=` is required. `model`, `effort`, `tier` (codex only),
-  `subagents` fall back to the side-wide flags. `focus=` must be last and takes the rest of the
-  string (commas allowed). A reviewer may use the same CLI as the author.
+- Comma-separated `key=value`; `cli=claude|codex|agy` is required. `model`, `effort`, `tier`
+  (codex only), `subagents` (not agy) fall back to the side-wide flags. `focus=` must be last and
+  takes the rest of the string (commas allowed). A reviewer may use the same CLI as the author.
+- `--trio` is shorthand for one reviewer per other CLI with side-wide settings; for per-reviewer
+  models, efforts or focuses write the `--reviewer` flags out instead.
 - Ids: author `A`, reviewers `R1..RK` in flag order. All reviewers run in parallel and every
   reviewer reviews every round, including ones that approved before.
 - **Converged** = every reviewer returned a review this round AND every one says APPROVE. A
@@ -99,6 +134,10 @@ Each round is two full agent runs against both Anthropic and OpenAI quota.
   records a contradiction between reviewers in `dissent.md` as `[R1 vs R2]`.
 - Reviewers see the solution, `changelog.md` and `dissent.md`, never each other's raw reviews,
   so they stay independent. A reviewer with a focus reviews only that aspect.
+- `--crosstalk` (1.5.0) lets the reviewers talk to each other: from round 2 each reviewer also
+  reads the other reviewers' reviews from the previous round (minus calls that failed), and
+  tags its reactions `[AGREE Rk]` / `[DISPUTE Rk]`. It may raise a point as its own only after
+  verifying it. The author is told how to read those tags. Round 1 is always independent.
 
 ## Persistent context (1.2.0)
 
@@ -106,8 +145,9 @@ By default each agent keeps one conversation for the whole run: the first call s
 `--session-id`, Codex `--json` to capture the thread id), and every later round resumes it (Claude `--resume`,
 Codex `codex exec resume` with `sandbox_mode="read-only"` forced, since resume has no `-s` flag). Resumed prompts
 tell the agent to re-read only the files that changed. This saves the re-reading of evidence each round.
+agy: the first call's `--output-format json` result carries `conversation_id`, resumed with `--conversation`.
 `--fresh-context` restores the old behaviour (every call a new process with no memory). Session ids are stored in
-the run directory per agent id as `.claude_session.<id>` / `.codex_session.<id>` (1.4.0; e.g.
+the run directory per agent id as `.claude_session.<id>` / `.codex_session.<id>` / `.agy_session.<id>` (1.4.0; e.g.
 `.claude_session.A`, `.codex_session.R2`), so every panel reviewer keeps its own conversation. The reviewer still re-checks the revised solution; it
 simply remembers what it verified before.
 
@@ -136,8 +176,9 @@ and summarize where the author and each reviewer currently disagree.
 | `review-N-R<k>.md` | reviewer k's review in round N, ending in a `VERDICT:` line (pre-1.4.0 runs: `review-N.md`) |
 | `dissent.md` | points the author refused to concede, with reasoning |
 | `changelog.md` | what changed each round and what was rejected |
-| `loop.log` | timestamped run log |
+| `loop.log` | timestamped run log (including any actions agy was refused) |
 | `meta.env`, `state.env` | run config and live state |
+| `agy-files.txt`, `.agy-result.<id>.json`, `.agy-guard.sh`, `.agy-ws.<id>/` | agy's file list, its last raw JSON result, its read-only guard, its workspace |
 
 ## Terminal states
 
@@ -185,7 +226,7 @@ Where `setsid` is missing (Git Bash on Windows) it falls back to `nohup` +
 
 ## Relationship to the bridge
 
-This skill drives the `claude` and `codex` CLIs directly rather than the
+This skill drives the `claude`, `codex` and `agy` CLIs directly rather than the
 claude-codex-bridge MCP tools, because the bridge blocks nested calls at
 `BRIDGE_DEPTH >= 2` - an agent reached through the bridge cannot call back.
 Two top-level processes side-step that, and detaching is what survives a
@@ -196,7 +237,13 @@ for long unattended runs.
 
 ## Requirements
 
-`claude` and `codex` on `PATH` and authenticated. `converge.sh` resolves both
+Every CLI the panel uses on `PATH` and authenticated (`start` checks only the ones in the
+panel). Started from the Claude desktop app, this session's own auth does not carry over: the
+nested `claude -p` uses the CLI's stored login, which can be expired while this session works
+("OAuth session expired and could not be refreshed" in `loop.log`); fix with `claude` + `/login`
+in a terminal. `agy` is also found at `~/.gemini/bin/agy`; it must have been signed in once
+interactively (run `agy` in a terminal), since headless `-p` cannot complete a login, and agy
+agents need `jq` or `python3` to read agy's JSON output. `converge.sh` resolves everything
 to absolute paths at start and records them in `meta.env`, so the detached
 worker does not need a login shell.
 
