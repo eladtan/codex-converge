@@ -215,6 +215,8 @@ By default each agent keeps one conversation for the whole run:
 
 On later rounds the agents are told to re-read only the files that changed, which saves re-reading all the evidence every round. Every panel reviewer keeps its own session (`.claude_session.<id>`, `.codex_session.<id>`, `.agy_session.<id>` in the run directory). Subagents always start empty, so agents are told to use them only for reading they have not done yet. Pass `--fresh-context` to start every call from scratch instead.
 
+Gemini (`agy`) compacts a long conversation into a summary, which drops the files it read. Before resuming an `agy` agent, the loop checks its transcript (`~/.gemini/antigravity-cli/brain/<conversation_id>/.system_generated/logs/transcript.jsonl`, or `$CODEX_CONVERGE_AGY_BRAIN/...`). If its last turn compacted, or the transcript cannot be read, the agent is told to re-read the evidence its reply depends on instead of relying on what it read before.
+
 ## License
 
 [MIT](LICENSE)

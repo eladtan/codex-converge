@@ -151,6 +151,12 @@ the run directory per agent id as `.claude_session.<id>` / `.codex_session.<id>`
 `.claude_session.A`, `.codex_session.R2`), so every panel reviewer keeps its own conversation. The reviewer still re-checks the revised solution; it
 simply remembers what it verified before.
 
+agy compacts a long conversation into a summary (seen at about 250k tokens of context, a `CHECKPOINT` step in
+`~/.gemini/antigravity-cli/brain/<conversation_id>/.system_generated/logs/transcript.jsonl`). From 1.5.1, before
+resuming an agy agent the loop checks that transcript; if its last turn compacted, or the transcript cannot be read,
+the agent is told it holds only a summary and must re-read the evidence its reply depends on. `loop.log` records
+each such round. `CODEX_CONVERGE_AGY_BRAIN` overrides the transcript directory.
+
 ## Checking on a run
 
 ```bash

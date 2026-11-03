@@ -28,6 +28,8 @@
 # sandbox_mode="read-only" forced on every resumed call (resume has no -s flag).
 # agy: first call prints --output-format json, whose conversation_id is resumed with --conversation.
 # 1.4.0: session files are per agent id (.claude_session.A, .codex_session.R2, .agy_session.R3, ...).
+# 1.5.1: agy compacts a long conversation into a summary (a CHECKPOINT step in its transcript). A
+# resumed agy agent whose last turn compacted is told to re-read its evidence, not to rely on it.
 #
 # Reviewer panel (1.4.0): one author (id A) and 1..6 reviewers (R1..RK) that review in
 # parallel. Converged = every reviewer returned a review this round AND every one approved.
@@ -42,7 +44,7 @@
 
 set -uo pipefail
 
-VERSION="1.5.0"
+VERSION="1.5.1"
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 STATE_ROOT="${CODEX_CONVERGE_HOME:-$HOME/.codex-converge}"
 RUNS_DIR="$STATE_ROOT/runs"
@@ -51,6 +53,8 @@ MAX_REVIEWERS=6
 CALL_TIMEOUT="${CODEX_CONVERGE_CALL_TIMEOUT:-1800}"
 CLIS="claude codex agy"
 DEFAULT_AGY_MODEL="${CODEX_CONVERGE_AGY_MODEL:-gemini-4-argon}"
+# Where agy 1.4.12 keeps each conversation's transcript: BRAIN/<conversation_id>/.system_generated/logs/.
+AGY_BRAIN="${CODEX_CONVERGE_AGY_BRAIN:-$HOME/.gemini/antigravity-cli/brain}"
 
 # The only agy tool the PreToolUse guard lets through, and only for paths under the context dir or
 # the run dir. agy 1.4.12 headless has no list/search tool: read_file is its one reader.
@@ -448,6 +452,15 @@ RESUME_NOTE="[Continuing your earlier session in this loop: you already hold the
 Re-read only the files named below, which changed since your last turn; do not re-read unchanged
 evidence unless the revision depends on it. Your earlier findings still stand unless you revise them.]"
 
+compacted_note() {  # compacted_note WHEN - the resume note for an agent whose conversation was summarised
+  cat <<N
+[Continuing your earlier session in this loop, but your conversation $1, so treat what you
+remember of earlier rounds as a summary, not the text itself. Re-read the files named below, and
+re-read the evidence your reply depends on (the code, data or documents it cites) before relying on
+it. Check an earlier finding against the files before you repeat or withdraw it.]
+N
+}
+
 subagent_note() {  # subagent_note CLI N
   local how
   if [ "$1" = claude ]; then how="the Agent tool with subagent_type \"reader\" (read-only: Read, Glob, Grep)"
@@ -570,6 +583,26 @@ PY
   esac
 }
 
+# agy_compacted CID - "yes" if agy compacted conversation CID during its latest turn (a CHECKPOINT step
+# after the last USER_INPUT in its transcript), "no" if not, "unknown" if the transcript is missing or
+# cannot be parsed.
+agy_compacted() {
+  local t="$AGY_BRAIN/$1/.system_generated/logs/transcript.jsonl" types
+  [ -n "$1" ] && [ -s "$t" ] || { echo unknown; return 0; }
+  case "$(basename "$JSON_TOOL")" in
+    jq) types="$("$JSON_TOOL" -r '.type // empty' "$t" 2>/dev/null)" || { echo unknown; return 0; } ;;
+    *)  types="$("$JSON_TOOL" -I - "$t" 2>/dev/null <<'PY'
+import json, sys
+for line in open(sys.argv[1], encoding="utf-8"):
+    if line.strip():
+        print(json.loads(line).get("type") or "")
+PY
+)" || { echo unknown; return 0; } ;;
+  esac
+  printf '%s\n' "$types" | awk '$0 == "USER_INPUT" {u = NR} $0 == "CHECKPOINT" {c = NR}
+    END {if (!u) print "unknown"; else if (c > u) print "yes"; else print "no"}'
+}
+
 # agent_call RUN ID PROMPT OUTFILE - one read-only agent call, run SYNCHRONOUSLY.
 # Callers always run it in the background and wait on it (see spawn_agent), so a TERM
 # arriving mid-call interrupts the wait at once, and reviewers can run in parallel.
@@ -585,8 +618,20 @@ agent_call() {
   local resuming=0
   [ "${PERSIST:-0}" = 1 ] && [ -s "$sess_file" ] && resuming=1
 
+  # A compacted agy conversation holds a summary, not the evidence the plain resume note says it holds.
+  local resume_note="$RESUME_NOTE"
+  if [ "$resuming" = 1 ] && [ "$cli" = agy ]; then
+    case "$(agy_compacted "$(cat "$sess_file")")" in
+      no) ;;
+      yes) resume_note="$(compacted_note "was compacted during your last turn")"
+           log "$id agy: conversation was compacted during its last turn; told to re-read its evidence" ;;
+      *)   resume_note="$(compacted_note "may have been compacted since your last turn")"
+           log "$id agy: cannot read its transcript under $AGY_BRAIN to check for compaction; told to re-read its evidence" ;;
+    esac
+  fi
+
   {
-    [ "$resuming" = 1 ] && printf '%s\n\n' "$RESUME_NOTE"
+    [ "$resuming" = 1 ] && printf '%s\n\n' "$resume_note"
     is_count "$subs" && [ "$subs" -gt 0 ] && { subagent_note "$cli" "$subs"; echo; }
     printf '%s' "$prompt"
   } > "$pfile"
