@@ -30,6 +30,8 @@
 # 1.4.0: session files are per agent id (.claude_session.A, .codex_session.R2, .agy_session.R3, ...).
 # 1.5.1: agy compacts a long conversation into a summary (a CHECKPOINT step in its transcript). A
 # resumed agy agent whose last turn compacted is told to re-read its evidence, not to rely on it.
+# 1.5.2: stop (and the worker's TERM/INT trap) also kills the run's agent calls by their timeout
+# process groups; a group kill of the worker missed them and left the CLIs running.
 #
 # Reviewer panel (1.4.0): one author (id A) and 1..6 reviewers (R1..RK) that review in
 # parallel. Converged = every reviewer returned a review this round AND every one approved.
@@ -44,7 +46,7 @@
 
 set -uo pipefail
 
-VERSION="1.5.1"
+VERSION="1.5.2"
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 STATE_ROOT="${CODEX_CONVERGE_HOME:-$HOME/.codex-converge}"
 RUNS_DIR="$STATE_ROOT/runs"
@@ -107,6 +109,32 @@ kill_tree() {
   sleep 2
   for pid in $kids $root; do
     if kill -0 "$pid" 2>/dev/null; then kill -KILL "$pid" 2>/dev/null; fi
+  done
+}
+
+# run_calls RUN - pids of RUN's live agent calls, found by the `timeout` wrapper of each call, whose
+# arguments name the run dir (--add-dir RUN for claude and agy, -o RUN/... for codex). Found by name,
+# not by tree: once its parent subshell dies, the wrapper is reparented to init.
+run_calls() {
+  ps -ef 2>/dev/null | awk -v id="$(basename "$1")" \
+    'NR > 1 && $8 ~ /(^|\/)timeout$/ && match($0, "/" id "(/| |$)") {print $2}'
+}
+
+# kill_calls RUN - TERM, then KILL, every agent call of RUN with everything it started. GNU timeout
+# runs in a process group of its own, which a TERM to the worker's group never reaches, so each
+# call's group is signalled directly (a wrapper that does not lead its own group gets kill_tree).
+kill_calls() {
+  local p pg calls i=0
+  calls="$(run_calls "$1")"
+  [ -n "$calls" ] || return 0
+  for p in $calls; do
+    pg="$(ps -o pgid= -p "$p" 2>/dev/null | tr -d ' ')"
+    if [ "$pg" = "$p" ]; then kill -TERM -- "-$p" 2>/dev/null; else kill_tree "$p"; fi
+  done
+  while [ "$i" -lt 5 ] && [ -n "$(run_calls "$1")" ]; do sleep 1; i=$((i + 1)); done
+  # KILL a group only while it still has members: until the last one exits its id cannot be reused.
+  for p in $calls; do
+    ps -eo pgid= 2>/dev/null | awk -v g="$p" '$1 == g {f = 1} END {exit !f}' && kill -KILL -- "-$p" 2>/dev/null
   done
 }
 
@@ -936,7 +964,7 @@ worker() {
   local nrev="${REVIEWERS:-1}"
 
   # On TERM, take every in-flight agent process down with us.
-  trap 'log "terminated by signal"; for p in $CHILD_PIDS; do kill_tree "$p"; done; set_state "$run" STATUS stopped; exit 143' TERM INT
+  trap 'log "terminated by signal"; for p in $CHILD_PIDS; do kill_tree "$p"; done; kill_calls "$run"; set_state "$run" STATUS stopped; exit 143' TERM INT
 
   set_state "$run" STATUS running
   log "run $RUN_ID on $HOST (v${VERSION:-?}) : author=$(agent_label A) reviewers=$nrev rounds=$ROUNDS crosstalk=${CROSSTALK:-0}"
@@ -1125,8 +1153,16 @@ cmd_stop() {
   pgid="$(get_state "$run" PGID)"
   pid="$(get_state "$run" PID)"
 
+  local calls
   if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
-    echo "no live process for that run"
+    # The worker can be gone while calls it started live on (an older stop, a crash).
+    calls="$(run_calls "$run" | wc -w | tr -d ' ')"
+    if [ "$calls" -gt 0 ]; then
+      kill_calls "$run"
+      echo "no live worker for that run; killed $calls leftover agent call(s)"
+    else
+      echo "no live process for that run"
+    fi
     set_state "$run" STATUS stopped
     return 0
   fi
@@ -1142,11 +1178,15 @@ cmd_stop() {
     sleep 1
     i=$((i + 1))
   done
+  # Only now, with the worker gone and unable to start another call, sweep the calls it left.
+  calls="$(run_calls "$run" | wc -w | tr -d ' ')"
+  kill_calls "$run"
   if kill -0 "$pid" 2>/dev/null; then
     echo "warning: pid $pid still alive after SIGKILL - check it by hand"
   else
-    echo "stopped run $(basename "$run") (pid $pid and descendants)"
+    echo "stopped run $(basename "$run") (pid $pid and descendants; $calls agent call(s) outlived the worker and were killed)"
   fi
+  [ -n "$(run_calls "$run")" ] && echo "warning: agent calls of this run are still alive - check them by hand"
   set_state "$run" STATUS stopped
 }
 

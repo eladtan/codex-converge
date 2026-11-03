@@ -169,6 +169,11 @@ each such round. `CODEX_CONVERGE_AGY_BRAIN` overrides the transcript directory.
 With no run id these act on the most recent run. `watch` tails the log - never
 call it from a tool, it does not exit. Use `status`.
 
+`stop` kills the worker first, then every agent call of the run that is still alive (1.5.2). Each call runs
+under GNU `timeout`, which leads its own process group, so killing the worker's group used to miss it and leave
+the CLI running until its timeout. Calls are found by the run directory in their arguments, so `stop` on a run
+whose worker is already gone still cleans up after it.
+
 When asked how a run is going: call `status`, read the newest `review-N-R<k>.md` files,
 and summarize where the author and each reviewer currently disagree.
 

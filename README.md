@@ -103,6 +103,8 @@ $S stop            # terminate the loop
 
 With no run id, `status`, `show`, `watch` and `stop` act on the most recent run.
 
+`stop` ends the worker and then every agent call the run still has alive, including calls whose worker has already exited. Each call runs under `timeout`, which sits in its own process group, so they are found by the run directory in their arguments and killed group by group.
+
 ### Options for `start`
 
 | Flag | Meaning | Default |
