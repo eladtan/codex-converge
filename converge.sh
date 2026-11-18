@@ -34,6 +34,10 @@
 # process groups; a group kill of the worker missed them and left the CLIs running.
 # 1.6.0: newest models by default - codex gpt-6.2-sol, agy gemini-4-carbon (env-overridable; claude
 # keeps the CLI default); `models` lists what each CLI offers now.
+# 1.6.1: agy can finish a whole reply yet report status=ERROR (a 503 "No capacity" it hit and retried
+# mid-turn). Such a call now counts if the reply is complete for its role - a reviewer's last line is
+# a well-formed VERDICT line, an author's reply carries its CHANGELOG and DISSENT trailer - and the
+# log names the error. A 503 failure that is not salvageable is retried once after a backoff.
 #
 # Reviewer panel (1.4.0): one author (id A) and 1..6 reviewers (R1..RK) that review in
 # parallel. Converged = every reviewer returned a review this round AND every one approved.
@@ -48,7 +52,7 @@
 
 set -uo pipefail
 
-VERSION="1.6.0"
+VERSION="1.6.1"
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 STATE_ROOT="${CODEX_CONVERGE_HOME:-$HOME/.codex-converge}"
 RUNS_DIR="$STATE_ROOT/runs"
@@ -61,6 +65,9 @@ DEFAULT_AGY_MODEL="${CODEX_CONVERGE_AGY_MODEL:-gemini-4-carbon}"
 DEFAULT_CODEX_MODEL="${CODEX_CONVERGE_CODEX_MODEL-gpt-6.2-sol}"
 # Where agy 1.4.12 keeps each conversation's transcript: BRAIN/<conversation_id>/.system_generated/logs/.
 AGY_BRAIN="${CODEX_CONVERGE_AGY_BRAIN:-$HOME/.gemini/antigravity-cli/brain}"
+# 1.6.1: how often an agy call that failed on a capacity error (503) is repeated, and the wait first.
+AGY_RETRIES="${CODEX_CONVERGE_AGY_RETRIES:-1}"
+AGY_RETRY_DELAY="${CODEX_CONVERGE_AGY_RETRY_DELAY:-120}"
 
 # The only agy tool the PreToolUse guard lets through, and only for paths under the context dir or
 # the run dir. agy 1.4.12 headless has no list/search tool: read_file is its one reader.
@@ -638,6 +645,29 @@ PY
     END {if (!u) print "unknown"; else if (c > u) print "yes"; else print "no"}'
 }
 
+# agy_reply_complete ID FILE - succeed if FILE holds a whole reply for agent ID's role, the shape its
+# prompt demands. Reviewer (R*): the last non-blank line is "VERDICT: APPROVE" or
+# "VERDICT: CHANGES_REQUIRED". Author (A): a solution, then the CHANGELOG marker line, then the
+# DISSENT marker line, each followed by a non-blank body. A reply cut off before its end fails.
+agy_reply_complete() {
+  [ -s "$2" ] || return 1
+  case "$1" in
+    R*) awk 'NF {l = $0} END {exit !(l ~ /^VERDICT:[[:space:]]*(APPROVE|CHANGES_REQUIRED)[[:space:]]*$/)}' "$2" ;;
+    A)  awk -v a="$MARK_CHANGELOG" -v b="$MARK_DISSENT" '
+          BEGIN {s = 0}
+          s == 0 && index($0, a) {s = 1; next}
+          s == 1 && index($0, b) {s = 2; next}
+          NF {n[s]++}
+          END {exit !(s == 2 && n[0] && n[1] && n[2])}' "$2" ;;
+    *)  return 1 ;;
+  esac
+}
+
+# agy_capacity_error TEXT - succeed if agy's error field is a capacity error (HTTP 503 / UNAVAILABLE).
+agy_capacity_error() {
+  case "$1" in *"code 503"*|*UNAVAILABLE*|*"No capacity"*) return 0 ;; *) return 1 ;; esac
+}
+
 # agent_call RUN ID PROMPT OUTFILE - one read-only agent call, run SYNCHRONOUSLY.
 # Callers always run it in the background and wait on it (see spawn_agent), so a TERM
 # arriving mid-call interrupts the wait at once, and reviewers can run in parallel.
@@ -723,23 +753,42 @@ agent_call() {
     else
       ptext="$(cat "$pfile")"
     fi
-    ( cd "$ws" && exec timeout "$CALL_TIMEOUT" "$AGY_BIN" "${g[@]}" -p="$ptext" ) \
-      < /dev/null > "$res" 2>> "$run/loop.log"
-    rc=$?
-    # A policy refusal (denied_actions) ends a headless turn mid-reply with status SUCCESS, so it
-    # counts as a failed call: a cut-off reply must never become the solution or a review.
-    local status reason denied
-    status="$(agy_json "$res" status)"
-    reason="$(agy_json "$res" finished_reason)"
-    denied="$(agy_json "$res" denied_actions)"
-    agy_json "$res" response > "$out"
-    if [ "$rc" = 0 ] && [ -n "$denied" ]; then
-      log "$id agy: agy's policy refused an action, which ended the turn early: $(printf '%s' "$denied" | tr '\n' ' ' | cut -c1-300)"
-      rc=1
-    elif [ "$rc" = 0 ] && { [ -n "$reason" ] || [ "$status" != SUCCESS ]; }; then
-      log "$id agy: turn did not complete (status=${status:-none} finished_reason=${reason:-none})"
-      rc=1
-    fi
+    local status reason denied err tries=0
+    while :; do
+      ( cd "$ws" && exec timeout "$CALL_TIMEOUT" "$AGY_BIN" "${g[@]}" -p="$ptext" ) \
+        < /dev/null > "$res" 2>> "$run/loop.log"
+      rc=$?
+      # A policy refusal (denied_actions) ends a headless turn mid-reply with status SUCCESS, so it
+      # counts as a failed call: a cut-off reply must never become the solution or a review.
+      status="$(agy_json "$res" status)"
+      reason="$(agy_json "$res" finished_reason)"
+      denied="$(agy_json "$res" denied_actions)"
+      err="$(agy_json "$res" error | tr '\n' ' ' | sed 's/ *$//' | cut -c1-300)"
+      agy_json "$res" response > "$out"
+      if [ "$rc" = 0 ] && [ -n "$denied" ]; then
+        log "$id agy: agy's policy refused an action, which ended the turn early: $(printf '%s' "$denied" | tr '\n' ' ' | cut -c1-300)"
+        rc=1
+      elif [ "$rc" = 0 ] && { [ -n "$reason" ] || [ "$status" != SUCCESS ]; }; then
+        # 1.6.1: an API error agy hit (and retried) mid-turn can leave status=ERROR on a reply that
+        # is whole. Only finished_reason=error qualifies: print_timeout means agy cut the turn short.
+        if [ "$status" = ERROR ] && [ "$reason" = error ] && agy_reply_complete "$id" "$out"; then
+          log "$id agy: warning: status=ERROR (${err:-no error text}) but the reply is complete; accepting it"
+        else
+          log "$id agy: turn did not complete (status=${status:-none} finished_reason=${reason:-none}${err:+ error: $err})"
+          rc=1
+        fi
+      fi
+      [ "$rc" = 0 ] && break
+      # One more try after a capacity error, unless the call used up its time or agy refused an action.
+      if [ "$tries" -lt "$AGY_RETRIES" ] && [ "$rc" != 124 ] && [ -z "$denied" ] \
+         && [ "$reason" != print_timeout ] && agy_capacity_error "$err"; then
+        tries=$((tries + 1))
+        log "$id agy: capacity error; retrying ($tries/$AGY_RETRIES) in ${AGY_RETRY_DELAY}s"
+        sleep "$AGY_RETRY_DELAY"
+        continue
+      fi
+      break
+    done
     if [ "$rc" = 0 ] && [ "${PERSIST:-0}" = 1 ] && [ ! -s "$sess_file" ]; then
       local cid; cid="$(agy_json "$res" conversation_id)"
       if [ -n "$cid" ]; then printf '%s\n' "$cid" > "$sess_file"; log "$id agy: conversation $cid"

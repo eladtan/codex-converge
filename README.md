@@ -136,6 +136,8 @@ Environment variables:
 - `CODEX_CONVERGE_CALL_TIMEOUT`: per-agent-call timeout in seconds (default `1800`).
 - `CODEX_CONVERGE_AGY_MODEL`: default Gemini model (default `gemini-4-carbon`).
 - `CODEX_CONVERGE_CODEX_MODEL`: default Codex model (default `gpt-6.2-sol`). Set it to an empty string to use the model in your `~/.codex/config.toml`.
+- `CODEX_CONVERGE_AGY_RETRIES`: how many times a Gemini call that failed on a capacity error (HTTP 503) is repeated (default `1`; `0` turns retries off).
+- `CODEX_CONVERGE_AGY_RETRY_DELAY`: seconds to wait before that retry (default `120`).
 
 **Write a self-contained task.** Each agent is a separate process that knows nothing about your chat. A task like "fix the bug we discussed" means nothing to it.
 
@@ -205,6 +207,7 @@ Every run gets its own directory, `~/.codex-converge/runs/<id>/`:
   `agy` runs with its working directory in an empty per-agent workspace inside the run directory, and never gets subagents. Live-tested on 2026-11-01 (agy 1.4.12): `write_file`, `edit_file` and `run_command` (`ls`, `touch`, a nested `agy`) were all refused, and the context directory, `.git` included, was left untouched.
 - `agy`'s headless toolset has no directory listing or search, so each run writes a list of the context directory's git-tracked files to `agy-files.txt` in the run directory for `agy` agents to read.
 - If `agy`'s own policy refuses an action, the headless turn ends mid-reply. The loop treats that as a failed call, so a cut-off reply never becomes the solution or a review.
+- `agy` can finish a reply and still report an error (for example a 503 "No capacity" it hit and retried mid-turn). The loop accepts such a reply only if it is complete: a review must end with its `VERDICT:` line, and the author's reply must carry its changelog and dissent sections. Otherwise the call fails.
 - Every file the loop produces is written by `converge.sh` itself, and only into the run directory.
 
 The worst case for an unattended run is therefore a bad document in a scratch directory, never a damaged repository. To apply the agreed solution, read `solution.md` and apply it yourself in a normal, supervised session. Please don't fork this with write permissions turned on.

@@ -44,6 +44,17 @@ Every agent, and every subagent, runs **strictly read-only**:
   refusing first: a refusal by agy's own policy ends a headless turn mid-reply (status still
   SUCCESS, `denied_actions` set), so the loop treats any `denied_actions` as a failed call, while a
   hook refusal comes back as a tool error the agent reads and continues past.
+- agy can write a whole reply and still report `status=ERROR`, `finished_reason=error` (for example
+  `UNAVAILABLE (code 503): No capacity available for model ...`, an API error it hit and retried
+  mid-turn). From 1.6.1 such a call counts if the reply is complete for its role: a reviewer's last
+  non-blank line is `VERDICT: APPROVE` or `VERDICT: CHANGES_REQUIRED`; an author's reply has a
+  solution, then the `=== CHANGELOG ===` and `=== DISSENT ===` marker lines, each with a non-blank
+  body. `loop.log` then shows `warning: status=ERROR (...) but the reply is complete`. Anything else
+  stays a failed call, and so do `finished_reason=print_timeout` (agy cut the turn short) and
+  `denied_actions`. A failed call whose error is a 503/`UNAVAILABLE` is repeated
+  `CODEX_CONVERGE_AGY_RETRIES` times (default 1) after `CODEX_CONVERGE_AGY_RETRY_DELAY` seconds
+  (default 120); each try gets the full call timeout. A cut-off final DISSENT section cannot be told
+  from a complete one.
 - agy's headless toolset has no list, search or grep tool (`read_file` is its only reader), so
   each run writes the context dir's git-tracked file list to `<run>/agy-files.txt` (non-git dirs:
   `find -maxdepth 4`) and agy prompts point at it. Expect agy to be weaker than the others at
