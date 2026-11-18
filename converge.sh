@@ -32,6 +32,8 @@
 # resumed agy agent whose last turn compacted is told to re-read its evidence, not to rely on it.
 # 1.5.2: stop (and the worker's TERM/INT trap) also kills the run's agent calls by their timeout
 # process groups; a group kill of the worker missed them and left the CLIs running.
+# 1.6.0: newest models by default - codex gpt-6.2-sol, agy gemini-4-carbon (env-overridable; claude
+# keeps the CLI default); `models` lists what each CLI offers now.
 #
 # Reviewer panel (1.4.0): one author (id A) and 1..6 reviewers (R1..RK) that review in
 # parallel. Converged = every reviewer returned a review this round AND every one approved.
@@ -42,11 +44,11 @@
 # never needs a controlling terminal and survives SSH disconnect / logout.
 #
 #   converge.sh start --task "..." [--rounds N] [--dir DIR] [--author claude|codex|agy] [--reviewer SPEC]... [--trio] [--crosstalk]
-#   converge.sh status [RUN] | watch [RUN] | show [RUN] | list | stop [RUN]
+#   converge.sh status [RUN] | watch [RUN] | show [RUN] | list | stop [RUN] | models
 
 set -uo pipefail
 
-VERSION="1.5.2"
+VERSION="1.6.0"
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 STATE_ROOT="${CODEX_CONVERGE_HOME:-$HOME/.codex-converge}"
 RUNS_DIR="$STATE_ROOT/runs"
@@ -54,7 +56,9 @@ DEFAULT_ROUNDS=4
 MAX_REVIEWERS=6
 CALL_TIMEOUT="${CODEX_CONVERGE_CALL_TIMEOUT:-1800}"
 CLIS="claude codex agy"
-DEFAULT_AGY_MODEL="${CODEX_CONVERGE_AGY_MODEL:-gemini-4-argon}"
+DEFAULT_AGY_MODEL="${CODEX_CONVERGE_AGY_MODEL:-gemini-4-carbon}"
+# Empty (CODEX_CONVERGE_CODEX_MODEL=) defers to ~/.codex/config.toml.
+DEFAULT_CODEX_MODEL="${CODEX_CONVERGE_CODEX_MODEL-gpt-6.2-sol}"
 # Where agy 1.4.12 keeps each conversation's transcript: BRAIN/<conversation_id>/.system_generated/logs/.
 AGY_BRAIN="${CODEX_CONVERGE_AGY_BRAIN:-$HOME/.gemini/antigravity-cli/brain}"
 
@@ -148,6 +152,7 @@ codex-converge - run a Claude <-> Codex <-> Gemini (agy) review loop until they 
   converge.sh show   [RUN]      print the current solution
   converge.sh list              all runs, newest first
   converge.sh stop   [RUN]      terminate a running loop
+  converge.sh models            models each CLI offers now (codex cache, agy live, claude aliases)
 
 start options:
   --task "<text>"         the task (or --task-file FILE)
@@ -163,12 +168,14 @@ start options:
                           codex and agy review); cannot be combined with --reviewer
   --crosstalk             from round 2, each reviewer also reads the other reviewers' reviews
                           from the previous round and may endorse or dispute their points
-  --agy-model M           agy (Gemini) model (default: $DEFAULT_AGY_MODEL)
-  --agy-effort E          agy effort, e.g. low|medium|high for argon (default: the model's default)
-  --codex-model M         codex model slug (default: ~/.codex/config.toml)
-  --codex-effort E        codex reasoning effort: low|medium|high|xhigh|max
+  --agy-model M           agy (Gemini) model: gemini-4-carbon|gemini-4-hydrogen|gemini-4-argon|
+                          gemini-3.8-flash (default: $DEFAULT_AGY_MODEL)
+  --agy-effort E          agy effort: low|medium|high (hydrogen also xhigh) (default: the model's default)
+  --codex-model M         codex model slug, e.g. gpt-6.2-sol|gpt-6.2-astra|gpt-6.1-terra
+                          (default: $DEFAULT_CODEX_MODEL; CODEX_CONVERGE_CODEX_MODEL= uses config.toml)
+  --codex-effort E        codex reasoning effort: low|medium|high|xhigh|max, ultra (not on luna)
   --codex-tier T          codex service tier, e.g. fast|flex|default (default: ~/.codex/config.toml)
-  --claude-model M        claude model for the claude side (default: CLI default)
+  --claude-model M        claude model, e.g. fable|opus|sonnet or claude-fable-5-2 (default: CLI default)
   --claude-effort E       claude effort: low|medium|high|xhigh|max (default: the calling agent's
                           effort, from \$CLAUDE_EFFORT when started inside Claude Code)
   --claude-subagents N    let each claude agent use up to N parallel read-only subagents
@@ -231,7 +238,7 @@ agent_label() {  # agent_label ID  -> "R1 codex/gpt-6-astra/high [focus: numeric
 cmd_start() {
   local task="" task_file="" rounds="$DEFAULT_ROUNDS" workdir="$PWD"
   local author="claude" foreground=0 trio=0 crosstalk=0
-  local codex_model="" codex_effort="" codex_tier="" claude_model="" claude_effort="${CLAUDE_EFFORT:-}" persist=1
+  local codex_model="$DEFAULT_CODEX_MODEL" codex_effort="" codex_tier="" claude_model="" claude_effort="${CLAUDE_EFFORT:-}" persist=1
   local agy_model="$DEFAULT_AGY_MODEL" agy_effort=""
   local claude_subs="" codex_subs="" both_subs=""
   local -a reviewer_specs=()
@@ -1190,6 +1197,44 @@ cmd_stop() {
   set_state "$run" STATUS stopped
 }
 
+cmd_models() {  # what each CLI can run now; read-only, starts no agent
+  local agy_bin cache="${CODEX_HOME:-$HOME/.codex}/models_cache.json"
+  echo "== codex (from $cache; codex refreshes it) =="
+  if [ -f "$cache" ] && command -v python3 >/dev/null 2>&1; then
+    python3 -I - "$cache" <<'PYM'
+import json, sys
+d = json.load(open(sys.argv[1]))
+ms = d.get("models", []) if isinstance(d, dict) else d
+for m in ms:
+    if m.get("visibility") == "hide":
+        continue
+    eff = [x.get("effort") for x in m.get("supported_reasoning_levels") or []]
+    print(f"  {m.get('slug'):<20} effort: {'|'.join(e for e in eff if e)}")
+if isinstance(d, dict) and d.get("fetched_at"):
+    print(f"  (cache fetched {d['fetched_at']})")
+PYM
+  else
+    echo "  no model cache or no python3; run codex once"
+  fi
+  local codex_cfg="${CODEX_HOME:-$HOME/.codex}/config.toml"
+  [ -f "$codex_cfg" ] && grep -E '^model(_reasoning_effort)? *=' "$codex_cfg" | sed 's/^/  config: /'
+  echo "  default here: ${DEFAULT_CODEX_MODEL:-config.toml}"
+  echo
+  echo "== agy / Gemini (agy models; pass the base name to --agy-model, the suffix to --agy-effort) =="
+  agy_bin="$(command -v agy || true)"
+  [ -z "$agy_bin" ] && [ -x "$HOME/.gemini/bin/agy" ] && agy_bin="$HOME/.gemini/bin/agy"
+  if [ -n "$agy_bin" ]; then
+    timeout 60 "$agy_bin" models 2>/dev/null | grep -v '^Fetching' | sed 's/^/  /' || echo "  agy models failed"
+  else
+    echo "  agy not found"
+  fi
+  echo "  default here: $DEFAULT_AGY_MODEL"
+  echo
+  echo "== claude (no list command; aliases resolve to the newest of each family) =="
+  echo "  fable -> claude-fable-5-2   opus -> claude-opus-5-5   sonnet -> claude-sonnet-5-5   haiku -> claude-haiku-5-5"
+  echo "  effort: low|medium|high|xhigh|max   default: the claude CLI's default model"
+}
+
 mkdir -p "$RUNS_DIR" 2>/dev/null || true
 cmd="${1:-help}"
 if [ $# -gt 0 ]; then shift; fi
@@ -1201,6 +1246,7 @@ case "$cmd" in
   show)    cmd_show "$@" ;;
   stop)    cmd_stop "$@" ;;
   _worker) worker "$@" ;;
+  models)  cmd_models "$@" ;;
   version) echo "codex-converge $VERSION" ;;
   help|-h|--help) usage ;;
   *) usage; exit 1 ;;

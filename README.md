@@ -99,6 +99,7 @@ $S show            # print the current solution
 $S list            # all runs, newest first
 $S watch           # follow the log (Ctrl-C only stops watching)
 $S stop            # terminate the loop
+$S models          # list the models each CLI offers right now
 ```
 
 With no run id, `status`, `show`, `watch` and `stop` act on the most recent run.
@@ -116,12 +117,12 @@ With no run id, `status`, `show`, `watch` and `stop` act on the most recent run.
 | `--reviewer SPEC` | Add a reviewer to the panel (repeatable, up to 6). See [Reviewer panel](#reviewer-panel). | one reviewer, the other CLI |
 | `--trio` | The panel is the two CLIs other than the author, so all three models work on the task | off |
 | `--crosstalk` | From round 2, each reviewer also reads the other reviewers' previous-round reviews. See [Crosstalk](#crosstalk). | off |
-| `--agy-model M` | Gemini model for `agy` agents | `gemini-4-argon` |
-| `--agy-effort E` | Gemini effort: `low`, `medium` or `high` | the model's default |
-| `--codex-model M` | Codex model slug | your `~/.codex/config.toml` |
-| `--codex-effort E` | Codex reasoning effort: `low`, `medium`, `high`, `xhigh` or `max` | config |
+| `--agy-model M` | Gemini model for `agy` agents: `gemini-4-carbon`, `gemini-4-hydrogen`, `gemini-4-argon` or `gemini-3.8-flash` | `gemini-4-carbon` |
+| `--agy-effort E` | Gemini effort: `low`, `medium` or `high` (`gemini-4-hydrogen` also `xhigh`) | the model's default |
+| `--codex-model M` | Codex model slug, e.g. `gpt-6.2-sol`, `gpt-6.2-astra` or `gpt-6.1-terra` | `gpt-6.2-sol` |
+| `--codex-effort E` | Codex reasoning effort: `low`, `medium`, `high`, `xhigh`, `max` or `ultra` (not on `luna` models) | config |
 | `--codex-tier T` | Codex service tier, e.g. `fast` | config |
-| `--claude-model M` | Claude model alias, e.g. `opus` | CLI default |
+| `--claude-model M` | Claude model alias (`fable`, `opus`, `sonnet`, `haiku`) or a full id such as `claude-fable-5-2` | CLI default |
 | `--claude-effort E` | Claude effort: `low`, `medium`, `high`, `xhigh` or `max` | the calling agent's effort (`$CLAUDE_EFFORT`) |
 | `--claude-subagents N` | Each Claude agent may use up to N parallel read-only subagents. **Soft cap**: enforced by the prompt only. `0` means none. | none |
 | `--codex-subagents N` | Each Codex agent is capped at N parallel subagents. **Hard cap**, set through Codex config; subagents cannot spawn their own. `0` turns Codex subagents off. | your `~/.codex/config.toml` |
@@ -133,7 +134,8 @@ Environment variables:
 
 - `CODEX_CONVERGE_HOME`: where runs are stored (default `~/.codex-converge`).
 - `CODEX_CONVERGE_CALL_TIMEOUT`: per-agent-call timeout in seconds (default `1800`).
-- `CODEX_CONVERGE_AGY_MODEL`: default Gemini model (default `gemini-4-argon`).
+- `CODEX_CONVERGE_AGY_MODEL`: default Gemini model (default `gemini-4-carbon`).
+- `CODEX_CONVERGE_CODEX_MODEL`: default Codex model (default `gpt-6.2-sol`). Set it to an empty string to use the model in your `~/.codex/config.toml`.
 
 **Write a self-contained task.** Each agent is a separate process that knows nothing about your chat. A task like "fix the bug we discussed" means nothing to it.
 
@@ -145,7 +147,7 @@ Environment variables:
 
 ```bash
 $S start --task "..." --dir ~/my-project \
-   --reviewer "cli=codex,model=gpt-6-astra,effort=high,subagents=4" \
+   --reviewer "cli=codex,model=gpt-6.2-astra,effort=high,subagents=4" \
    --reviewer "cli=agy,effort=high" \
    --reviewer "cli=claude,focus=numerical stability, units and edge cases"
 

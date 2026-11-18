@@ -10,7 +10,7 @@ allowed-tools: "Bash, Read, Glob, Grep"
 Drives a review loop: one agent writes a solution, a panel of one or more reviewers
 (default: one, the other CLI) critiques it in parallel, the author revises, repeat until
 every reviewer approves or the loop deadlocks. Three CLIs can take part: `claude`, `codex`
-and `agy` (Gemini through the Antigravity CLI, default model `gemini-4-argon`). The
+and `agy` (Gemini through the Antigravity CLI, default model `gemini-4-carbon`). The
 deliverable is a document, not a code change.
 
 The driver is `converge.sh`, in this skill's directory.
@@ -82,12 +82,12 @@ SKILL_DIR=~/.claude/skills/codex-converge
 | `--reviewer SPEC` | add a panel reviewer (repeatable, max 6, warns above 3); see below | one reviewer, the other CLI |
 | `--trio` | panel = the two CLIs other than the author (three models on one task); not with `--reviewer` | off |
 | `--crosstalk` | from round 2, each reviewer also reads the others' previous-round reviews | off |
-| `--agy-model M` | agy (Gemini) model | `gemini-4-argon` (env `CODEX_CONVERGE_AGY_MODEL`) |
-| `--agy-effort E` | agy effort; argon offers low\|medium\|high | the model's default |
-| `--codex-model M` | Codex model slug, e.g. `gpt-6-astra` | ~/.codex/config.toml |
+| `--agy-model M` | agy (Gemini) model: `gemini-4-carbon`, `gemini-4-hydrogen`, `gemini-4-argon`, `gemini-3.8-flash` | `gemini-4-carbon` (env `CODEX_CONVERGE_AGY_MODEL`) |
+| `--agy-effort E` | agy effort: low\|medium\|high; hydrogen also xhigh | the model's default |
+| `--codex-model M` | Codex model slug: `gpt-6.2-sol`, `gpt-6.2-astra`, `gpt-6.1-terra`, ... | `gpt-6.2-sol` (env `CODEX_CONVERGE_CODEX_MODEL`; set it empty to use ~/.codex/config.toml) |
 | `--codex-effort E` | Codex reasoning effort: low\|medium\|high\|xhigh\|max | config |
 | `--codex-tier T` | Codex service tier, e.g. `fast` (passed as `-c service_tier="T"`; 1.2.2) | config |
-| `--claude-model M` | Claude model alias for the Claude side, e.g. `opus` | CLI default |
+| `--claude-model M` | Claude model: `fable` (claude-fable-5-2), `opus` (claude-opus-5-5), `sonnet`, `haiku`, or a full id | CLI default |
 | `--claude-effort E` | Claude effort (`--effort`): low\|medium\|high\|xhigh\|max; 1.2.3 | the calling agent's effort (`$CLAUDE_EFFORT`) |
 | `--claude-subagents N` | each Claude agent may use up to N parallel read-only subagents (**soft cap**: prompt-enforced; 0 = none) | unset = none |
 | `--codex-subagents N` | each Codex agent capped at N parallel subagents (**hard cap**: `agents.max_threads`, `max_concurrent_threads_per_session` = N, `max_depth` = 1); `0` = `--disable multi_agent` | unset = `~/.codex/config.toml` untouched |
@@ -116,7 +116,7 @@ each other, not only with the author.
 
 ## Reviewer panel (1.4.0)
 
-`--reviewer "cli=codex,model=gpt-6-astra,effort=high,tier=fast,subagents=4,focus=numerical stability"`
+`--reviewer "cli=codex,model=gpt-6.2-astra,effort=high,tier=fast,subagents=4,focus=numerical stability"`
 `--reviewer "cli=agy,effort=high,focus=physics and units"`
 
 - Comma-separated `key=value`; `cli=claude|codex|agy` is required. `model`, `effort`, `tier`
@@ -164,7 +164,13 @@ each such round. `CODEX_CONVERGE_AGY_BRAIN` overrides the transcript directory.
 "$SKILL_DIR/converge.sh" list      # every run, newest first
 "$SKILL_DIR/converge.sh" show      # the current solution
 "$SKILL_DIR/converge.sh" stop      # terminate the loop
+"$SKILL_DIR/converge.sh" models    # models each CLI offers now (1.6.0)
 ```
+
+The model names in the table above were checked on 2026-11-18 (codex-cli 0.166, agy 1.5.11, claude 2.1.322).
+When the user asks for "the latest" model or one not listed, run `models` instead of trusting the table: Codex
+comes from its model cache, Gemini from `agy models` (pass the base name to `--agy-model` and the suffix to
+`--agy-effort`), Claude from its aliases, which always resolve to the newest model of each family.
 
 With no run id these act on the most recent run. `watch` tails the log - never
 call it from a tool, it does not exit. Use `status`.
